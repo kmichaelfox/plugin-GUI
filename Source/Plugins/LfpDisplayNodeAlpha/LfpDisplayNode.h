@@ -32,6 +32,8 @@ class DataViewport;
 
 namespace LfpDisplayNodeAlpha 
 {
+    
+class CircularCacheBuffer;
 
 /**
 
@@ -67,6 +69,8 @@ public:
 
     CriticalSection* getMutex() { return &displayMutex; }
 
+    Atomic<int> * updateCacheBuffer = nullptr;
+    CircularCacheBuffer* displayCacheBuffer = nullptr;
 
 private:
     void initializeEventChannels();
@@ -77,6 +81,8 @@ private:
     Array<int> displayBufferIndex;
     Array<uint32> eventSourceNodes;
     std::map<uint32, int> channelForEventSource;
+    
+    std::function<int(int)> channelSampleCount;
 
     int numEventChannels;
 

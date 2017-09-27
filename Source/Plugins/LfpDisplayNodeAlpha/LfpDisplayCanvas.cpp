@@ -31,9 +31,11 @@ using namespace LfpDisplayNodeAlpha;
 
 #pragma mark - LfpDisplayCanvas -
 
-LfpDisplayCanvas::LfpDisplayCanvas(LfpDisplayNode* processor_) :
-     timebase(1.0f), displayGain(1.0f),   timeOffset(0.0f),
-    processor(processor_)
+LfpDisplayCanvas::LfpDisplayCanvas(LfpDisplayNode* processor_)
+    : timebase(1.0f)
+    , displayGain(1.0f)
+    , timeOffset(0.0f)
+    , processor(processor_)
 {
 
     nChans = processor->getNumInputs();
@@ -42,6 +44,12 @@ LfpDisplayCanvas::LfpDisplayCanvas(LfpDisplayNode* processor_) :
     displayBuffer = processor->getDisplayBufferAddress();
     displayBufferSize = displayBuffer->getNumSamples();
     std::cout << "Setting displayBufferSize on LfpDisplayCanvas to " << displayBufferSize << std::endl;
+    
+    displayCacheBuffer = new CircularCacheBuffer();
+    updateCacheBuffer.set(true);
+    
+    processor_->displayCacheBuffer = displayCacheBuffer;
+    processor_->updateCacheBuffer = &updateCacheBuffer;
 
     screenBuffer = new AudioSampleBuffer(MAX_N_CHAN, MAX_N_SAMP);
     screenBuffer->clear();
@@ -205,13 +213,19 @@ void LfpDisplayCanvas::update()
     screenBufferIndex.clear();
     lastScreenBufferIndex.clear();
     displayBufferIndex.clear();
+    
+    float maxSampleRate = 0;
 
     for (int i = 0; i <= nChans; i++) // extra channel for events
     {
 		if (processor->getNumInputs() > 0)
 		{
 			if (i < nChans)
-				sampleRate.add(processor->getDataChannel(i)->getSampleRate());
+            {
+                auto rate = processor->getDataChannel(i)->getSampleRate();
+                sampleRate.add(rate);
+                if (maxSampleRate < rate) maxSampleRate = rate;
+            }
 			else
 			{
 				//Since for now the canvas only supports one event channel, find the first TTL one and use that as sampleRate.
@@ -220,7 +234,9 @@ void LfpDisplayCanvas::update()
 				{
 					if (processor->getEventChannel(c)->getChannelType() == EventChannel::TTL)
 					{
-						sampleRate.add(processor->getEventChannel(c)->getSampleRate());
+                        auto rate = processor->getEventChannel(c)->getSampleRate();
+						sampleRate.add(rate);
+                        if (maxSampleRate < rate) maxSampleRate = rate;
 					}
 				}
 			}
@@ -228,6 +244,7 @@ void LfpDisplayCanvas::update()
 		else
         {
 			sampleRate.add(30000);
+            if (maxSampleRate < 30000) maxSampleRate = 30000;
         }
         
        // std::cout << "Sample rate for ch " << i << " = " << sampleRate[i] << std::endl; 
@@ -235,6 +252,9 @@ void LfpDisplayCanvas::update()
         screenBufferIndex.add(0);
         lastScreenBufferIndex.add(0);
     }
+    
+    displayCacheBuffer->setSize(nChans + 1, maxSampleRate);
+    displayCacheBuffer->setSampleRates(sampleRate);
 
     if (nChans != lfpDisplay->getNumChannels())
     {
@@ -317,18 +337,133 @@ void LfpDisplayCanvas::refreshScreenBuffer()
 
 }
 
+void LfpDisplayCanvas::fillScreenBufferWithHistory()
+{
+    const float pixelsNeeded = getWidth() - leftmargin - scrollBarThickness;
+//    std::cout << "screenBuffer->getNumSamples() = " << screenBuffer->getNumSamples() << std::endl;
+//    std::cout << "pixelsNeeded: " << pixelsNeeded << std::endl;
+    
+    for (size_t channel = 0; channel <= nChans; ++channel)
+    {
+        const float samplesNeeded = sampleRate[channel] * timebase;
+        const float sampsPerPixel = samplesNeeded / pixelsNeeded; // samples / pixel
+        float subSampleOffset = 0;
+        
+            
+        size_t cacheIdx = options->getScrubModePositionOffset() * displayCacheBuffer->getNumSamples();
+        for (int pix = 0; pixelsNeeded > 0 && pixelsNeeded < 1000000 && samplesNeeded > 0 && pix < pixelsNeeded; ++pix)
+        {
+            
+            float gain = 1.0f;
+            float alpha = subSampleOffset;
+            float invAlpha = 1.0f - alpha;
+            
+            screenBuffer->clear(channel, pix, 1);
+            screenBufferMean->clear(channel, pix, 1);
+            screenBufferMin->clear(channel, pix, 1);
+            screenBufferMax->clear(channel, pix, 1);
+            
+            // update continuous data channels
+            if (channel != nChans)
+            {
+                // interpolate between two samples with invAlpha and alpha
+//                screenBuffer->addSample(channel, pix, invAlpha*gain*displayCacheBuffer->readSample(channel, cacheIdx));
+                screenBuffer->addFrom(channel,
+                                      pix,
+                                      displayCacheBuffer->getReadPointer(channel, cacheIdx),
+                                      1,
+                                      invAlpha*gain);
+                
+//                screenBuffer->addSample(channel, pix, alpha*gain*displayCacheBuffer->readSample(channel, cacheIdx + 1));
+                screenBuffer->addFrom(channel,
+                                      pix,
+                                      displayCacheBuffer->getReadPointer(channel, cacheIdx),
+                                      1,
+                                      alpha*gain);
+                
+            }
+            
+            // same thing again, but this time add the min,mean, and max of all samples in current pixel
+            float sample_min   =  10000000;
+            float sample_max   = -10000000;
+            float sample_mean  =  0;
+            
+            int cacheIdxForNextPix = cacheIdx + sampsPerPixel; //  position to next pixels index
+            
+            for (int j = cacheIdx; j < cacheIdxForNextPix; ++j)
+            {
+                
+                float sample_current = *displayCacheBuffer->getReadPointer(channel, j);
+                
+                sample_mean = sample_mean + sample_current;
+                
+                if (sample_min>sample_current)
+                {
+                    sample_min=sample_current;
+                }
+                
+                if (sample_max<sample_current)
+                {
+                    sample_max=sample_current;
+                }
+                
+            }
+            
+            // update event channel
+            if (channel == nChans)
+            {
+                screenBuffer->setSample(channel, pix, sample_max);
+            }
+            
+            // similarly, for each pixel on the screen, we want a list of all values so we can draw a histogram later
+            // for simplicity, we'll just do this as 2d array, samplesPerPixel[px][samples]
+            // with an additional array sampleCountPerPixel[px] that holds the N samples per pixel
+            if (channel < nChans) // we're looping over one 'extra' channel for events above, so make sure not to loop over that one here
+            {
+                int c = 0;
+                for (int j = cacheIdx; j < cacheIdxForNextPix && c < MAX_N_SAMP_PER_PIXEL; ++j)
+                {
+                    float sample_current = *displayCacheBuffer->getReadPointer(channel, j);
+                    samplesPerPixel[channel][pix][c]=sample_current;
+                    c++;
+                }
+                if (c>0){
+                    sampleCountPerPixel[pix]=c-1; // save count of samples for this pixel
+                }else{
+                    sampleCountPerPixel[pix]=0;
+                }
+                sample_mean = sample_mean/c;
+                screenBufferMean->addSample(channel, pix, sample_mean*gain);
+                
+                screenBufferMin->addSample(channel, pix, sample_min*gain);
+                screenBufferMax->addSample(channel, pix, sample_max*gain);
+            }
+            
+            subSampleOffset += sampsPerPixel;
+            
+            while (subSampleOffset >= 1.0)
+            {
+                ++cacheIdx;
+                subSampleOffset -= 1.0;
+            }
+        }
+    }
+    
+    fullredraw = true;
+}
+
 void LfpDisplayCanvas::updateScreenBuffer()
 {
 
     // copy new samples from the displayBuffer into the screenBuffer
-    int maxSamples = lfpDisplay->getWidth() - leftmargin;
+    int maxPixels = lfpDisplay->getWidth() - leftmargin;
 
 	ScopedLock displayLock(*processor->getMutex());
 
     for (int channel = 0; channel <= nChans; channel++) // pull one extra channel for event display
     {
 
-        if (screenBufferIndex[channel] >= maxSamples) // wrap around if we reached right edge before
+        if (screenBufferIndex[channel] >= maxPixels) // wrap around if we reached right edge before
             screenBufferIndex.set(channel, 0);
 
          // hold these values locally for each channel - is this a good idea?
@@ -353,11 +488,11 @@ void LfpDisplayCanvas::updateScreenBuffer()
 
         float ratio = sampleRate[channel] * timebase / float(getWidth() - leftmargin - scrollBarThickness); // samples / pixel
         // this number is crucial: converting from samples to values (in px) for the screen buffer
-        int valuesNeeded = (int) float(nSamples) / ratio; // N pixels needed for this update
+        int pixelsNeeded = (int) float(nSamples) / ratio; // N pixels needed for this update
 
-        if (sbi + valuesNeeded > maxSamples)  // crop number of samples to fit canvas width
+        if (sbi + pixelsNeeded > maxPixels)  // crop number of pixels to fit canvas width
         {
-            valuesNeeded = maxSamples - sbi;
+            pixelsNeeded = maxPixels - sbi;
         }
         float subSampleOffset = 0.0;
 
@@ -370,19 +505,19 @@ void LfpDisplayCanvas::updateScreenBuffer()
 //                       << sbi << " : " 
 //                       << index << " : " 
 //                       << dbi << " : " 
-//                       << valuesNeeded << " : " 
+//                       << pixelsNeeded << " : "
 //                       << ratio 
 //                                     << std::endl;
         
-        if (valuesNeeded > 0 && valuesNeeded < 1000000)
+        if (pixelsNeeded > 0 && pixelsNeeded < 1000000)
         {
-            for (int i = 0; i < valuesNeeded; i++) // also fill one extra sample for line drawing interpolation to match across draws
+            for (int i = 0; i < pixelsNeeded; i++) // also fill one extra sample for line drawing interpolation to match across draws
             {
                 //If paused don't update screen buffers, but update all indexes as needed
                 if (!lfpDisplay->isPaused)
                 {
                     float gain = 1.0;
-                    float alpha = (float) subSampleOffset;
+                    float alpha = subSampleOffset;
                     float invAlpha = 1.0f - alpha;
 
                     screenBuffer->clear(channel, sbi, 1);
@@ -401,8 +536,8 @@ void LfpDisplayCanvas::updateScreenBuffer()
                                               displayBuffer->getReadPointer(channel, dbi), // source
                                               1, // numSamples
                                               invAlpha*gain); // gain
-
-
+                        
+                        
                         screenBuffer->addFrom(channel, // destChannel
                                               sbi, // destStartSample
                                               displayBuffer->getReadPointer(channel, nextPos), // source
@@ -422,7 +557,7 @@ void LfpDisplayCanvas::updateScreenBuffer()
                         nextpix=dbi;
                     }
                    
-                    for (int j = dbi; j < nextpix; j++)
+                    for (int j = dbi; j < nextpix; ++j)
                     {
                         
                         float sample_current = displayBuffer->getSample(channel, j);
@@ -450,25 +585,25 @@ void LfpDisplayCanvas::updateScreenBuffer()
                     // for simplicity, we'll just do this as 2d array, samplesPerPixel[px][samples]
                     // with an additional array sampleCountPerPixel[px] that holds the N samples per pixel
                     if (channel < nChans) // we're looping over one 'extra' channel for events above, so make sure not to loop over that one here
+                    {
+                        int c = 0;
+                        for (int j = dbi; j < nextpix && c < MAX_N_SAMP_PER_PIXEL; j++)
                         {
-                            int c = 0;
-                            for (int j = dbi; j < nextpix && c < MAX_N_SAMP_PER_PIXEL; j++)
-                            {
-                                float sample_current = displayBuffer->getSample(channel, j);
-                                samplesPerPixel[channel][sbi][c]=sample_current;
-                                c++;
-                            }
-                            if (c>0){
-                                sampleCountPerPixel[sbi]=c-1; // save count of samples for this pixel
-                            }else{
-                                sampleCountPerPixel[sbi]=0;
-                            }
-                            sample_mean = sample_mean/c;
-                            screenBufferMean->addSample(channel, sbi, sample_mean*gain);
-                            
-                            screenBufferMin->addSample(channel, sbi, sample_min*gain);
-                            screenBufferMax->addSample(channel, sbi, sample_max*gain);
+                            float sample_current = displayBuffer->getSample(channel, j);
+                            samplesPerPixel[channel][sbi][c]=sample_current;
+                            c++;
                         }
+                        if (c>0){
+                            sampleCountPerPixel[sbi]=c-1; // save count of samples for this pixel
+                        }else{
+                            sampleCountPerPixel[sbi]=0;
+                        }
+                        sample_mean = sample_mean/c;
+                        screenBufferMean->addSample(channel, sbi, sample_mean*gain);
+                        
+                        screenBufferMin->addSample(channel, sbi, sample_min*gain);
+                        screenBufferMax->addSample(channel, sbi, sample_max*gain);
+                    }
                     sbi++;
                 }
             
@@ -655,7 +790,9 @@ void LfpDisplayCanvas::paint(Graphics& g)
 void LfpDisplayCanvas::refresh()
 {
 
-    updateScreenBuffer();
+    
+    if (options->getScrubModeState() && fullredraw) fillScreenBufferWithHistory();
+    else updateScreenBuffer();
 
     lfpDisplay->refresh(); // redraws only the new part of the screen buffer
 
@@ -1305,14 +1442,7 @@ bool LfpDisplayOptions::getInputInvertedState()
 bool LfpDisplayOptions::getDisplaySpikeRasterizerState()
 {
 //    return spikeRasterButton->getToggleState();
-    return false;
-}
-
-void LfpDisplayOptions::setDisplaySpikeRasterizerState(bool isEnabled)
-{
-//    spikeRasterButton->setToggleState(isEnabled, dontSendNotification);
-    
-//    if (isEnabled) medianOffsetPlottingButton->setToggleState(true, sendNotification);
+    return spikeRasterSelection->getSelectedItemIndex() != 0;
 }
 
 void LfpDisplayOptions::setRangeSelection(float range, bool canvasMustUpdate)
@@ -1355,9 +1485,23 @@ void LfpDisplayOptions::setSpreadSelection(int spread, bool canvasMustUpdate, bo
     }
 }
 
+bool LfpDisplayOptions::getScrubModeState()
+{
+    return (timescale->getTimescaleMode() == LfpTimescale::TimescaleMode::SCRUB);
+}
+
+float LfpDisplayOptions::getScrubModePositionOffset()
+{
+    return timescale->getTimescaleScrubbingOffsetRatio();
+}
+
 void LfpDisplayOptions::togglePauseButton(bool sendUpdate)
 {
     pauseButton->setToggleState(!pauseButton->getToggleState(), sendUpdate ? sendNotification : dontSendNotification);
+    
+    // if the display is unpaused, make sure that scrub mode is not engaged
+    if (!pauseButton->getToggleState() && timescale->getTimescaleMode() == LfpTimescale::TimescaleMode::SCRUB)
+        timescale->setTimescaleMode(LfpTimescale::TimescaleMode::ACQUIRE);
 }
 
 void LfpDisplayOptions::buttonClicked(Button* b)
@@ -1406,6 +1550,8 @@ void LfpDisplayOptions::buttonClicked(Button* b)
     if (b == pauseButton)
     {
         lfpDisplay->isPaused = b->getToggleState();
+        canvas->updateCacheBuffer.set(!lfpDisplay->isPaused);
+        if (timescale->getTimescaleMode() == LfpTimescale::TimescaleMode::SCRUB) timescale->setTimescaleMode(LfpTimescale::TimescaleMode::ACQUIRE);
         return;
     }
 
@@ -1943,6 +2089,7 @@ void LfpDisplayOptions::loadParameters(XmlElement* xml)
 
 LfpTimescale::LfpTimescale(LfpDisplayCanvas* c, LfpDisplay* lfpDisplay)
     : canvas(c)
+    , timescaleMode(TimescaleMode::ACQUIRE)
     , lfpDisplay(lfpDisplay)
 {
 
@@ -1959,7 +2106,10 @@ void LfpTimescale::paint(Graphics& g)
 
     g.setFont(font);
 
-    g.setColour(Colour(100,100,100));
+    if (timescaleMode == TimescaleMode::ACQUIRE)
+        g.setColour(Colour(100,100,100));
+    else
+        g.setColour(Colour(150, 150, 255));
 
     const String timeScaleUnitLabel = (timebase >= 2)?("s:"):("ms:");
     g.drawText(timeScaleUnitLabel,5,0,100,getHeight(),Justification::left, false);
@@ -2009,12 +2159,21 @@ void LfpTimescale::paint(Graphics& g)
     }
 }
 
-void LfpTimescale::mouseUp(const MouseEvent &e)
+LfpTimescale::TimescaleMode LfpTimescale::getTimescaleMode()
 {
-    if (e.mods.isLeftButtonDown())
-    {
-        lfpDisplay->trackZoomInfo.isScrollingX = false;
-    }
+    return timescaleMode;
+}
+
+void LfpTimescale::setTimescaleMode(TimescaleMode mode)
+{
+    timescaleMode = mode;
+//    if (timescaleMode == TimescaleMode::SCRUB)
+//    {
+//        scrubWindowSpanRatio = (timebase / HISTORY_SCRUB_LENGTH);
+//        scrubHeadPositionRatio = 1.0f - scrubWindowSpanRatio;
+//    }
+    calculateTimescaleLabels();
+    canvas->redraw();
 }
 
 void LfpTimescale::resized()
@@ -2022,12 +2181,33 @@ void LfpTimescale::resized()
     setTimebase(timebase);
 }
 
+void LfpTimescale::mouseDown(const MouseEvent &e)
+{
+    // require the display to be paused before allowing the timescale mode to change
+    if (e.getNumberOfClicks() == 2 && lfpDisplay->isPaused)
+    {
+        setTimescaleMode((timescaleMode == TimescaleMode::ACQUIRE) ? TimescaleMode::SCRUB : TimescaleMode::ACQUIRE);
+        
+        repaint();
+    }
+}
+
+void LfpTimescale::mouseUp(const MouseEvent &e)
+{
+    if (e.mods.isLeftButtonDown())
+    {
+        lfpDisplay->trackZoomInfo.isScrollingX = false;
+        lfpDisplay->trackZoomInfo.isScrubbingX = false;
+    }
+}
+
 void LfpTimescale::mouseDrag(const juce::MouseEvent &e)
 {
     if (e.mods.isLeftButtonDown()) // double check that we initiate only for left click and hold
     {
-        if (e.mods.isCommandDown())  // CTRL + drag -> change channel spacing
+        if ((e.mods.isCommandDown() || lfpDisplay->trackZoomInfo.isScrollingX) && !lfpDisplay->trackZoomInfo.isScrubbingX)  // CTRL + drag -> change channel spacing
         {
+            std::cout << "zooming" << std::endl;
             // init state in our track zooming info struct
             if (!lfpDisplay->trackZoomInfo.isScrollingX)
             {
@@ -2075,13 +2255,64 @@ void LfpTimescale::mouseDrag(const juce::MouseEvent &e)
                 setTimebase(canvas->timebase);
             }
         }
+        else if (timescaleMode == TimescaleMode::SCRUB)
+        {
+            
+            if (!lfpDisplay->trackZoomInfo.isScrubbingX)
+            {
+                lfpDisplay->trackZoomInfo.isScrubbingX = true;
+                lfpDisplay->trackZoomInfo.scrubHeadStartPositionRatio = scrubHeadPositionRatio;
+            }
+            
+            int dragDeltaX = (e.getScreenPosition().getX() - e.getMouseDownScreenX()) / 25.0f;
+            
+            float scrubHeadPositionDelta = dragDeltaX * labelIncrement / HISTORY_SCRUB_LENGTH;
+            float newScrubHeadPosition = scrubHeadPositionDelta + lfpDisplay->trackZoomInfo.scrubHeadStartPositionRatio;
+            if (newScrubHeadPosition > (1.0f - scrubWindowSpanRatio))
+            {
+                newScrubHeadPosition = 1.0f - scrubWindowSpanRatio;
+            }
+            if (newScrubHeadPosition < 0)
+            {
+                newScrubHeadPosition = 0;
+            }
+            if (newScrubHeadPosition == scrubHeadPositionRatio)
+            {
+                return;
+            }
+            
+            scrubHeadPositionRatio = newScrubHeadPosition;
+            
+            calculateTimescaleLabels();
+            
+            canvas->fullredraw = true;
+            canvas->redraw();
+        }
     }
+}
+
+float LfpTimescale::getTimescaleScrubbingOffsetRatio()
+{
+    return scrubHeadPositionRatio;
+}
+
+float LfpTimescale::getTimescaleWindowSpanRatio()
+{
+    return scrubWindowSpanRatio;
 }
 
 void LfpTimescale::setTimebase(float t)
 {
     timebase = t;
+    
+    scrubWindowSpanRatio = (timebase / HISTORY_SCRUB_LENGTH);
+    scrubHeadPositionRatio = 1.0f - scrubWindowSpanRatio;
+    
+    calculateTimescaleLabels();
+}
 
+void LfpTimescale::calculateTimescaleLabels()
+{
     labels.clear();
     
     const int minWidth = 60;
@@ -2098,9 +2329,20 @@ void LfpTimescale::setTimebase(float t)
             labelIncrement += 0.2;
     }
     
+    const float offsetAmt = (1.0f - (scrubHeadPositionRatio + scrubWindowSpanRatio)) * HISTORY_SCRUB_LENGTH;
+    
     for (float i = labelIncrement; i < timebase; i += labelIncrement)
     {
-        String labelString = String(i * ((timebase >= 2)?(1):(1000.0f)));
+        String labelString;
+        if (timescaleMode == TimescaleMode::ACQUIRE)
+        {
+        labelString = String(i * ((timebase >= 2)?(1):(1000.0f)));
+        }
+        else
+        {
+            labelString = String((i - timebase - offsetAmt) * ((timebase >=2)?(1):(1000.0f)));
+        }
+        
         labels.add(labelString.substring(0,6));
     }
 
@@ -2202,7 +2444,7 @@ void LfpDisplay::setColorGrouping(int i)
 
 }
 
-LfpChannelColourScheme * LfpDisplay::getColourSchemePtr()
+LfpChannelColourScheme * const LfpDisplay::getColourSchemePtr() const
 {
     return colourSchemeList[activeColourScheme];
 }
@@ -2361,7 +2603,6 @@ void LfpDisplay::resized()
 
 void LfpDisplay::paint(Graphics& g)
 {
-
     g.drawImageAt(lfpChannelBitmap, canvas->leftmargin,0);
     
 }
@@ -2369,7 +2610,7 @@ void LfpDisplay::paint(Graphics& g)
 
 void LfpDisplay::refresh()
 {
-    
+    std::cout << "**** refreshing display" << std::endl;
     // X-bounds of this update
     int fillfrom = canvas->lastScreenBufferIndex[0];
     int fillto = (canvas->screenBufferIndex[0]);
@@ -2636,7 +2877,8 @@ void LfpDisplay::setChannelsReversed(bool state)
     }
     
     // necessary to overwrite lfpChannelBitmap's display
-    refresh();
+    canvas->fullredraw = true;
+    canvas->refresh();
 }
 
 int LfpDisplay::getChannelDisplaySkipAmount()
@@ -3179,7 +3421,6 @@ void LfpChannelDisplay::pxPaint()
     
     LfpBitmapPlotterInfo plotterInfo; // hold and pass plotting info for each plotting method class
     
-    
     for (int i = ifrom; i < ito ; i += stepSize) // redraw only changed portion
     {
         if (i < display->lfpChannelBitmap.getWidth())
@@ -3212,6 +3453,7 @@ void LfpChannelDisplay::pxPaint()
             
             // draw event markers
             int rawEventState = canvas->getYCoord(canvas->getNumChannels(), i);// get last channel+1 in buffer (represents events)
+            if (rawEventState && i == 0) std::cout << Time::getCurrentTime().toString(false, true) << " rawEventState " << rawEventState << std::endl;
             
             for (int ev_ch = 0; ev_ch < 8 ; ev_ch++) // for all event channels
             {
@@ -3333,7 +3575,6 @@ void LfpChannelDisplay::pxPaint()
             // now draw warnings, if needed
             if (canvas->drawClipWarning) // draw simple warning if display cuts off data
             {
-                
                 if(clipWarningHi) {
                     for (int j=0; j<=3; j++)
                     {
@@ -3695,6 +3936,7 @@ void LfpChannelDisplayInfo::mouseUp(const MouseEvent &e)
         if (display->trackZoomInfo.unpauseOnScrollEnd)
         {
             display->isPaused = false;
+            canvas->updateCacheBuffer.set(true);
             display->options->togglePauseButton(false);
         }
     }
@@ -3920,6 +4162,211 @@ void LfpViewport::visibleAreaChanged(const Rectangle<int>& newVisibleArea)
 
 
 
+#pragma mark - CircularCacheBuffer -
+CircularCacheBuffer::CircularCacheBuffer()
+{
+    displayBufferCache = new AudioSampleBuffer();
+    displayBufferCache->clear();
+}
+
+void CircularCacheBuffer::setSize(int numChannels, float samplerate)
+{
+    readPos.resize(numChannels, 0);
+    empty = true;
+//    bufferLen = samplerate * HISTORY_LENGTH_SECONDS;
+    // set the length to 10 seconds X the max sample rate
+    displayBufferCache->setSize(numChannels, samplerate * HISTORY_LENGTH_SECONDS); // this clears the contents at the same time
+}
+
+void CircularCacheBuffer::setSampleRates(Array<float> &sampleRatesList)
+{
+    sampleRates.clear();
+    bufferLen.clear();
+    for (int i = 0; i < sampleRatesList.size(); ++i)
+    {
+        sampleRates.push_back(sampleRatesList[i]);
+        
+        bufferLen.push_back(int(sampleRatesList[i] * HISTORY_LENGTH_SECONDS));
+    }
+}
+
+size_t CircularCacheBuffer::getNumSamples()
+{
+    return displayBufferCache->getNumSamples();
+}
+
+size_t CircularCacheBuffer::getNumChannels()
+{
+    return displayBufferCache->getNumChannels();
+}
+
+bool CircularCacheBuffer::isEmpty()
+{
+    return empty;
+}
+
+void CircularCacheBuffer::pushNewBuffer(AudioSampleBuffer &b, int nSamples)
+{
+//    std::cout << Time::getCurrentTime().toString(false, true) << " pushing a new buffer" << std::endl;
+//    ScopedLock bufferLock(bufferMtx);
+    if (empty) empty = false;
+    
+    const size_t len = (nSamples < 0) ? b.getNumSamples() : nSamples;
+    
+    for (size_t chan = 0; chan < b.getNumChannels(); ++chan)
+    {
+        const auto bufLen = bufferLen[chan];
+        const auto rPos = readPos[chan];
+        
+//        if (len < displayBufferCache->getNumSamples() - 1 - readPos[chan])
+        if (len < bufLen - 1 - rPos)
+        {
+            displayBufferCache->copyFrom(chan,
+                                         rPos,
+                                         b,
+                                         chan,
+                                         0,
+                                         len);
+            
+//            readPos = (readPos + len) % displayBufferCache->getNumSamples();
+        }
+        else
+        {
+            size_t extraSamples = (rPos + len) % bufLen;//displayBufferCache->getNumSamples();
+            
+            displayBufferCache->copyFrom(chan,      // destChannel
+                                         rPos,      // destStartSample
+                                         b,         // source
+                                         chan,      // sourceChannel
+                                         0,         // sourceStartSample
+                                         len - extraSamples); // numSamples
+            
+            displayBufferCache->copyFrom(chan,
+                                         0,
+                                         b,
+                                         chan,
+                                         len - extraSamples,
+                                         extraSamples);
+        }
+        int newIdx = rPos + len;
+        while (newIdx >= bufLen) newIdx -= bufLen;
+        readPos[chan] = newIdx;
+    }
+    
+}
+
+void CircularCacheBuffer::pushNewBuffer(AudioSampleBuffer &b, std::function<int (int)> getNumSamples)
+{
+    if (empty) empty = false;
+    
+    for (size_t chan = 0; chan < b.getNumChannels(); ++chan)
+    {
+        const auto len = getNumSamples(chan);
+        const auto bufLen = bufferLen[chan];
+        const auto rPos = readPos[chan];
+//        if (len < displayBufferCache->getNumSamples() - 1 - readPos[chan])
+        if (len < bufLen - 1 - rPos)
+        {
+            displayBufferCache->copyFrom(chan,
+                                         rPos,
+                                         b,
+                                         chan,
+                                         0,
+                                         len);
+            
+            //            readPos = (readPos + len) % displayBufferCache->getNumSamples();
+        }
+        else
+        {
+            const size_t extraSamples = (rPos + len) % bufLen;//displayBufferCache->getNumSamples();
+            
+            displayBufferCache->copyFrom(chan,      // destChannel
+                                         rPos,   // destStartSample
+                                         b,         // source
+                                         chan,      // sourceChannel
+                                         0,         // sourceStartSample
+                                         len - extraSamples); // numSamples
+            
+            displayBufferCache->copyFrom(chan,
+                                         0,
+                                         b,
+                                         chan,
+                                         len - extraSamples,
+                                         extraSamples);
+        }
+        
+        int newIdx = rPos + len;
+        while (newIdx >= bufLen) newIdx -= bufLen;
+        readPos[chan] = newIdx;
+    }
+    
+}
+
+float CircularCacheBuffer::readSample(int chan, size_t samp) const noexcept
+{
+    size_t idx = readPos[chan] + samp;
+    const int len = bufferLen[chan];
+    while (idx >= len)
+        idx -= len;
+    return *displayBufferCache->getReadPointer(chan, idx);
+}
+
+const float* CircularCacheBuffer::getReadPointer(int chan, size_t samp) const noexcept
+{
+    size_t idx = readPos[chan] + samp;
+    const int len = bufferLen[chan];
+    while (idx >= len)
+        idx -= len;
+    return displayBufferCache->getReadPointer(chan, idx);
+}
+
+void CircularCacheBuffer::writeSample(int chan, size_t samp, float value)
+{
+    size_t idx = readPos[chan] + samp;
+    const int len = bufferLen[chan];
+    if (idx >= len) idx %= len;
+    displayBufferCache->setSample(chan, idx, value);
+}
+
+void CircularCacheBuffer::writeSamples(int chan, int numSamples, AudioSampleBuffer& b, std::function<int(int)> getNumSamples)
+{
+    const auto len = getNumSamples(chan);
+    const auto bufLen = bufferLen[chan];
+    const auto rPos = readPos[chan];
+    //        if (len < displayBufferCache->getNumSamples() - 1 - readPos[chan])
+    if (len < bufLen - 1 - rPos)
+    {
+        displayBufferCache->copyFrom(chan,
+                                     rPos,
+                                     b,
+                                     chan,
+                                     0,
+                                     len);
+        
+        //            readPos = (readPos + len) % displayBufferCache->getNumSamples();
+    }
+    else
+    {
+        const size_t extraSamples = (rPos + len) % bufLen;//displayBufferCache->getNumSamples();
+        
+        displayBufferCache->copyFrom(chan,      // destChannel
+                                     rPos,   // destStartSample
+                                     b,         // source
+                                     chan,      // sourceChannel
+                                     0,         // sourceStartSample
+                                     len - extraSamples); // numSamples
+        
+        displayBufferCache->copyFrom(chan,
+                                     0,
+                                     b,
+                                     chan,
+                                     len - extraSamples,
+                                     extraSamples);
+    }
+}
+
+
+
 #pragma mark - PerPixelBitmapPlotter -
 
 PerPixelBitmapPlotter::PerPixelBitmapPlotter(LfpDisplay * lfpDisplay)
@@ -3938,7 +4385,6 @@ void PerPixelBitmapPlotter::plot(Image::BitmapData &bitmapData, LfpBitmapPlotter
     
     if (jfrom<0) {jfrom=0;};
     if (jto >= display->lfpChannelBitmap.getHeight()) {jto=display->lfpChannelBitmap.getHeight()-1;};
-    
     
     for (int j = jfrom; j <= jto; j += 1)
     {

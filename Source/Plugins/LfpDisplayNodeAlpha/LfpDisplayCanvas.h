@@ -45,6 +45,7 @@ class LfpChannelDisplayInfo;
 class EventDisplayInterface;
 class LfpViewport;
 class LfpDisplayOptions;
+class CircularCacheBuffer;
 class LfpBitmapPlotter;
 class PerPixelBitmapPlotter;
 class SupersampledBitmapPlotter;
@@ -155,6 +156,8 @@ public:
     bool  drawClipWarning; // optinally draw (subtle) warning if data is clipped in display
     bool  drawSaturationWarning; // optionally raise hell if the actual data is saturating
     
+    Atomic<int> updateCacheBuffer;
+    
     int nChans;
     //int nChansVisible; // the number of channels NOT hidden for display
 
@@ -181,6 +184,7 @@ private:
 
     LfpDisplayNode* processor;
     AudioSampleBuffer* displayBuffer; // sample wise data buffer for display
+    ScopedPointer<CircularCacheBuffer> displayCacheBuffer;
     ScopedPointer<AudioSampleBuffer> screenBuffer; // subsampled buffer- one int per pixel
 
     //'define 3 buffers for min mean and max for better plotting of spikes
@@ -197,6 +201,7 @@ private:
     ScopedPointer<LfpDisplayOptions> options;
 
     void refreshScreenBuffer();
+    void fillScreenBufferWithHistory();
     void updateScreenBuffer();
 
     Array<int> displayBufferIndex;
@@ -277,12 +282,13 @@ public:
     
     /** Return a bool describing whether the spike raster functionality is enabled */
     bool getDisplaySpikeRasterizerState();
-    
-    /** Sets the state of the spike raster functionality on/off */
-    void setDisplaySpikeRasterizerState(bool isEnabled);
 
     //void setRangeSelection(float range, bool canvasMustUpdate);
     void setSpreadSelection();
+    
+    bool getScrubModeState();
+    
+    float getScrubModePositionOffset();
 
     void togglePauseButton(bool sendUpdate = true);
 
@@ -420,6 +426,12 @@ private:
 class LfpTimescale : public Component
 {
 public:
+    enum class TimescaleMode
+    {
+        ACQUIRE = 0,
+        SCRUB
+    };
+    
     LfpTimescale(LfpDisplayCanvas*, LfpDisplay*);
     ~LfpTimescale();
 
@@ -431,11 +443,20 @@ public:
         be paused to zoom */
     void mouseDrag(const MouseEvent &e) override;
     
+    void mouseDown(const MouseEvent &e) override;
     void mouseUp(const MouseEvent &e) override;
+    
+    TimescaleMode getTimescaleMode();
+    void setTimescaleMode(TimescaleMode );
+    
+    float getTimescaleScrubbingOffsetRatio();
+    float getTimescaleWindowSpanRatio();
 
     void setTimebase(float t);
 
 private:
+    
+    const float HISTORY_SCRUB_LENGTH = 10.0f;
 
     LfpDisplayCanvas* canvas;
     LfpDisplay* lfpDisplay;
@@ -443,10 +464,17 @@ private:
     float timebase;
     float labelIncrement;
     float numIncrements;
+    
+    float scrubHeadPositionRatio;
+    float scrubWindowSpanRatio;
+    
+    TimescaleMode timescaleMode;
 
     Font font;
 
     StringArray labels;
+    
+    void calculateTimescaleLabels();
 
 };
 
@@ -499,7 +527,7 @@ public:
     void setChannelHeight(int r, bool resetSingle = true);
     int getChannelHeight();
     
-    LfpChannelColourScheme * getColourSchemePtr();
+    LfpChannelColourScheme * const getColourSchemePtr() const;
     
     /** Returns the sample rate that is currently filtering the drawable channels */
     float getDisplayedSampleRate();
@@ -625,9 +653,11 @@ public:
         
         bool isScrollingX = false;
         bool isScrollingY = false;
-        int componentStartHeight;       // a cache for the dimensions of a component during drag events
-        float timescaleStartScale;        // a cache for the timescale size during drag events
-        float zoomPivotRatioX;          // a cache for calculating the anchor point when adjusting viewport
+        bool isScrubbingX = false;
+        int componentStartHeight;          // a cache for the dimensions of a component during drag events
+        float timescaleStartScale;         // a cache for the timescale size during drag events
+        float scrubHeadStartPositionRatio;
+        float zoomPivotRatioX;             // a cache for calculating the anchor point when adjusting viewport
         float zoomPivotRatioY;
         Point<int> zoomPivotViewportOffset;                     // similar to above, but pixel-wise offset
         bool unpauseOnScrollEnd;
@@ -913,6 +943,50 @@ public:
 
 private:
     LfpDisplayCanvas* canvas;
+};
+    
+    
+    
+#pragma mark - CircularCacheBuffer -
+    
+class CircularCacheBuffer
+{
+public:
+    CircularCacheBuffer();
+    ~CircularCacheBuffer() {}
+    
+    CircularCacheBuffer (const CircularCacheBuffer &) = delete;
+    CircularCacheBuffer (CircularCacheBuffer &&) = delete;
+    CircularCacheBuffer& operator= (const CircularCacheBuffer &) = delete;
+    CircularCacheBuffer& operator= (CircularCacheBuffer &&) = delete;
+    
+    /** Sets the number of channels and allocates the necessary memory block.
+     
+        This needs to be called before using the buffer. */
+    void setSize (int numChannels, float samplerate);
+    void setSampleRates(Array<float> &sampleRatesList);
+    
+    size_t getNumSamples();
+    size_t getNumChannels();
+    bool isEmpty();
+    
+    void pushNewBuffer (AudioSampleBuffer & b, int nSamples = -1);
+    void pushNewBuffer(AudioSampleBuffer &b, std::function<int(int)> getNumSamples);
+    float readSample (int chan, size_t samp) const noexcept;
+    const float* getReadPointer (int chan, size_t samp) const noexcept;
+    void writeSample (int chan, size_t samp, float value);
+    void writeSamples (int chan, int numSamples, AudioSampleBuffer& b, std::function<int(int)> getNumSamples);
+private:
+    const float HISTORY_LENGTH_SECONDS = 10;
+//    size_t bufferLen;
+    std::vector<int> bufferLen; // avoid calculating buffer wrapping length on every sample
+    
+    bool empty = true;
+    std::vector<size_t> readPos;
+    std::vector<float> sampleRates;
+    size_t writePos;
+    ScopedPointer<AudioSampleBuffer> displayBufferCache;
+//    CriticalSection bufferMtx;
 };
 
     

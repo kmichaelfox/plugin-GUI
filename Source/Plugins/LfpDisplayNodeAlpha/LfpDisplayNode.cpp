@@ -38,6 +38,9 @@ LfpDisplayNode::LfpDisplayNode()
 
     displayBuffer = new AudioSampleBuffer (8, 100);
 
+    using std::placeholders::_1;
+    channelSampleCount = std::bind(&LfpDisplayNode::getNumSamples, this, _1);
+    
     const int heapSize = 5000;
     arrayOfOnes = new float[heapSize];
     for (int n = 0; n < heapSize; ++n)
@@ -280,10 +283,21 @@ void LfpDisplayNode::finalizeEventChannels()
         if (nSamples < samplesLeft)
         {
             newIdx = index + nSamples;
+            
         }
         else
         {
             newIdx = nSamples - samplesLeft;
+        }
+        
+        // write the events to the cachebuffer if exists and should be updated
+        if (updateCacheBuffer != nullptr && displayCacheBuffer != nullptr && updateCacheBuffer->get())
+        {
+            for (int j = 0; j < nSamples; ++j)
+            {
+                const int evt_idx = (j < samplesLeft) ? (index + j) : (j - samplesLeft);
+                displayCacheBuffer->writeSample(chan, j, displayBuffer->getSample(chan, evt_idx));
+            }
         }
         
         displayBufferIndex.set(chan, newIdx);
@@ -301,7 +315,6 @@ void LfpDisplayNode::process (AudioSampleBuffer& buffer)
     initializeEventChannels();
     checkForEvents (); // see if we got any TTL events
     finalizeEventChannels();
-
 
     for (int chan = 0; chan < buffer.getNumChannels(); ++chan)
     {
@@ -340,5 +353,8 @@ void LfpDisplayNode::process (AudioSampleBuffer& buffer)
             displayBufferIndex.set (chan, extraSamples);
         }
     }
+    
+    if (updateCacheBuffer != nullptr && displayCacheBuffer != nullptr && updateCacheBuffer->get())
+        displayCacheBuffer->pushNewBuffer(buffer, channelSampleCount);
 }
 
