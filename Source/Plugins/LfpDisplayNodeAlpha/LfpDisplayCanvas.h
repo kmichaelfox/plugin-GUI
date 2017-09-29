@@ -45,7 +45,6 @@ class LfpChannelDisplayInfo;
 class EventDisplayInterface;
 class LfpViewport;
 class LfpDisplayOptions;
-class CircularCacheBuffer;
 class LfpBitmapPlotter;
 class PerPixelBitmapPlotter;
 class SupersampledBitmapPlotter;
@@ -112,6 +111,9 @@ public:
     
     bool getDrawMethodState();
     
+    int getChannelDisplayBufferIndex(int channel);
+    int getDisplayBufferSize();
+    
     int getChannelSampleRate(int channel);
     
     /** Delegates a samplerate for drawing to the LfpDisplay referenced by this canvas */
@@ -139,6 +141,7 @@ public:
 
     Array<int> screenBufferIndex;
     Array<int> lastScreenBufferIndex;
+    Array<int> displayBufferScrubIndex;
 
     void saveVisualizerParameters(XmlElement* xml);
     void loadVisualizerParameters(XmlElement* xml);
@@ -184,7 +187,7 @@ private:
 
     LfpDisplayNode* processor;
     AudioSampleBuffer* displayBuffer; // sample wise data buffer for display
-    ScopedPointer<CircularCacheBuffer> displayCacheBuffer;
+    bool* isDisplayBufferDirty;
     ScopedPointer<AudioSampleBuffer> screenBuffer; // subsampled buffer- one int per pixel
 
     //'define 3 buffers for min mean and max for better plotting of spikes
@@ -201,7 +204,7 @@ private:
     ScopedPointer<LfpDisplayOptions> options;
 
     void refreshScreenBuffer();
-    void fillScreenBufferWithHistory();
+//    void fillScreenBufferWithHistory();
     void updateScreenBuffer();
 
     Array<int> displayBufferIndex;
@@ -453,6 +456,9 @@ public:
     float getTimescaleWindowSpanRatio();
 
     void setTimebase(float t);
+    
+    bool isUpToDate();
+    void update();
 
 private:
     
@@ -475,6 +481,9 @@ private:
     StringArray labels;
     
     void calculateTimescaleLabels();
+    void calculateDisplayBufferScrubbingIndices();
+    
+    bool upToDate;
 
 };
 
@@ -640,6 +649,7 @@ public:
 
     bool eventDisplayEnabled[8];
     bool isPaused; // simple pause function, skips screen buffer updates
+    Atomic<int> isPausedAtomic;
 
     LfpDisplayOptions* options;
     
@@ -943,50 +953,6 @@ public:
 
 private:
     LfpDisplayCanvas* canvas;
-};
-    
-    
-    
-#pragma mark - CircularCacheBuffer -
-    
-class CircularCacheBuffer
-{
-public:
-    CircularCacheBuffer();
-    ~CircularCacheBuffer() {}
-    
-    CircularCacheBuffer (const CircularCacheBuffer &) = delete;
-    CircularCacheBuffer (CircularCacheBuffer &&) = delete;
-    CircularCacheBuffer& operator= (const CircularCacheBuffer &) = delete;
-    CircularCacheBuffer& operator= (CircularCacheBuffer &&) = delete;
-    
-    /** Sets the number of channels and allocates the necessary memory block.
-     
-        This needs to be called before using the buffer. */
-    void setSize (int numChannels, float samplerate);
-    void setSampleRates(Array<float> &sampleRatesList);
-    
-    size_t getNumSamples();
-    size_t getNumChannels();
-    bool isEmpty();
-    
-    void pushNewBuffer (AudioSampleBuffer & b, int nSamples = -1);
-    void pushNewBuffer(AudioSampleBuffer &b, std::function<int(int)> getNumSamples);
-    float readSample (int chan, size_t samp) const noexcept;
-    const float* getReadPointer (int chan, size_t samp) const noexcept;
-    void writeSample (int chan, size_t samp, float value);
-    void writeSamples (int chan, int numSamples, AudioSampleBuffer& b, std::function<int(int)> getNumSamples);
-private:
-    const float HISTORY_LENGTH_SECONDS = 10;
-//    size_t bufferLen;
-    std::vector<int> bufferLen; // avoid calculating buffer wrapping length on every sample
-    
-    bool empty = true;
-    std::vector<size_t> readPos;
-    std::vector<float> sampleRates;
-    size_t writePos;
-    ScopedPointer<AudioSampleBuffer> displayBufferCache;
-//    CriticalSection bufferMtx;
 };
 
     

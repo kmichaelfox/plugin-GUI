@@ -64,25 +64,25 @@ public:
 	void handleEvent (const EventChannel* eventInfo, const MidiMessage& event, int samplePosition = 0) override;
 
     AudioSampleBuffer* getDisplayBufferAddress() const { return displayBuffer; }
+    
+    bool* const getDisplayBufferUpdateFlagAddress() { return &isDisplayBufferDirty; }
 
     int getDisplayBufferIndex (int chan) const { return displayBufferIndex[chan]; }
 
     CriticalSection* getMutex() { return &displayMutex; }
-
-    Atomic<int> * updateCacheBuffer = nullptr;
-    CircularCacheBuffer* displayCacheBuffer = nullptr;
+    
+    Atomic<int>* isCanvasPaused = nullptr;
 
 private:
     void initializeEventChannels();
     void finalizeEventChannels();
 
     ScopedPointer<AudioSampleBuffer> displayBuffer;
+    bool isDisplayBufferDirty;
 
     Array<int> displayBufferIndex;
     Array<uint32> eventSourceNodes;
     std::map<uint32, int> channelForEventSource;
-    
-    std::function<int(int)> channelSampleCount;
 
     int numEventChannels;
 

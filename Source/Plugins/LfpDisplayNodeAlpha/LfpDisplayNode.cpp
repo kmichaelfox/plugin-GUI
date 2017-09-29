@@ -33,13 +33,14 @@ LfpDisplayNode::LfpDisplayNode()
     , displayGain       (1)
     , bufferLength      (20.0f)
     , abstractFifo      (100)
+    , isDisplayBufferDirty(false)
 {
     setProcessorType (PROCESSOR_TYPE_SINK);
 
     displayBuffer = new AudioSampleBuffer (8, 100);
 
-    using std::placeholders::_1;
-    channelSampleCount = std::bind(&LfpDisplayNode::getNumSamples, this, _1);
+//    using std::placeholders::_1;
+//    channelSampleCount = std::bind(&LfpDisplayNode::getNumSamples, this, _1);
     
     const int heapSize = 5000;
     arrayOfOnes = new float[heapSize];
@@ -290,16 +291,6 @@ void LfpDisplayNode::finalizeEventChannels()
             newIdx = nSamples - samplesLeft;
         }
         
-        // write the events to the cachebuffer if exists and should be updated
-        if (updateCacheBuffer != nullptr && displayCacheBuffer != nullptr && updateCacheBuffer->get())
-        {
-            for (int j = 0; j < nSamples; ++j)
-            {
-                const int evt_idx = (j < samplesLeft) ? (index + j) : (j - samplesLeft);
-                displayCacheBuffer->writeSample(chan, j, displayBuffer->getSample(chan, evt_idx));
-            }
-        }
-        
         displayBufferIndex.set(chan, newIdx);
     }
 }
@@ -310,6 +301,12 @@ void LfpDisplayNode::process (AudioSampleBuffer& buffer)
     // 1. place any new samples into the displayBuffer
     //std::cout << "Display node sample count: " << nSamples << std::endl; ///buffer.getNumSamples() << std::endl;
 
+    // return early if the canvas is paused (don't copy to the displaybuffer)
+    if (isCanvasPaused != nullptr && isCanvasPaused->get()) {
+//        std::cout << Time::getCurrentTime().toString(false, true) << "skipping displaybuffer update in node, canvas is paused" << std::endl;
+        return;
+    }
+    
     ScopedLock displayLock (displayMutex);
     
     initializeEventChannels();
@@ -354,7 +351,6 @@ void LfpDisplayNode::process (AudioSampleBuffer& buffer)
         }
     }
     
-    if (updateCacheBuffer != nullptr && displayCacheBuffer != nullptr && updateCacheBuffer->get())
-        displayCacheBuffer->pushNewBuffer(buffer, channelSampleCount);
+    isDisplayBufferDirty = true;
 }
 
